@@ -26,7 +26,7 @@ The process uses a professional-grade Python script to automate the generation o
 
 ## Prerequisites
 
-* **Keeper Commander:** You must have a recent version (v17.6+) installed and configured on your machine.
+* **Keeper Commander:** You must have a recent version (v17.0.11+) installed and configured on your machine.
 * **Keeper Gateway:** A Keeper Gateway must be deployed with network access to the target Windows servers on **TCP port 5986** (the default for WinRM over HTTPS). You will need the **UID** of this gateway.
 * **Rotation Administrator (Recommended):** You should have an existing `pamUser` record in Keeper containing the credentials of a privileged account (e.g., a domain admin or service account) that has permission to reset passwords on all target servers. You will need the **UID** of this record.
 * **WinRM Certificate Trust:** The Keeper Gateway must trust the Certificate Authority (CA) that issued the WinRM TLS certificates on your target servers. If rotations fail due to certificate errors, re-run the script *without* the `--enable-ssl-verification` flag for testing purposes. For production, the recommended solution is to import the CA into the gateway's trust store.
