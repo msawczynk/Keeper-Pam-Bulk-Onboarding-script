@@ -1,117 +1,156 @@
 # Keeper PAM Bulk Onboarding Script
 
-> **Status:** ✅ **Maintained** – tested on **Keeper Commander ≥ 17.0.12**
->
-> Automates large‑scale creation of **pamUser** / **pamMachine** records, PAM Configs, Connections and Rotation schedules for Windows (or any WinRM‑enabled) servers.
->
-> **New in this fork**
->
-> | Feature                    | Description                                                                                                                                                       |
-> | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-> | **Nested folders**         | `--parent-folder` lets you drop the generated *Users* / *Resources* shared‑folders under an existing hierarchy instead of cluttering the vault root.              |
-> | **Always‑valid JSON**      | Output file now wraps records with `{ "shared_folders": [], "records": […] }` and includes the blank `$pamSettings` object Commander expects.                     |
-> | **One‑shot attach**        | Connection & Rotation commands now inject `--config`, so records are immediately bound to the right PAM Configuration – no more “resource not associated” errors. |
-> | **Proper schedule flag**   | Emits a valid JSON string for `-sj`, fixing the `JSONDecodeError` seen in 17.0.11.                                                                                |
-> | **Ports by protocol**      | Auto‑selects the correct default port (RDP 3389, SSH 22, etc.).                                                                                                   |
-> | **Cleaner logs / dry‑run** | Every output file respects `--dry-run`; logs go to `bulk_onboard_YYYYMMDDThhmmssZ.log`.                                                                           |
->
-> Legacy flags/behaviour remain unchanged – you can drop‑in replace the original script and old automation still works.
+Automate the onboarding of servers and credentials into [Keeper Secrets Manager (KSM)](https://keepersecurity.com/secrets-manager.html) for PAM. This script converts a simple CSV into fully configured, rotation-enabled PAM records, with a structured folder hierarchy and zero-touch setup.
 
 ---
 
-## TL;DR
+## Features
 
-```bash
-python3 create_pam_script_improved_fixed.py \
-  --gateway-uid <GW_UID> \
-  --csv servers_to_import.csv \
-  --user-folder PAM_Users \
-  --resource-folder PAM_Resources \
-  --parent-folder "My Vault/TestFolder" \
-  --rotation-admin-uid <ADMIN_UID>
-
-# import & run
-keeper import pam_records_import.json --format json
-bash pam_setup_commands.txt
-bash pam_connection_commands.txt
-bash pam_rotation_commands.txt
-```
-
-*Everything* will be wired, enabled and scheduled – zero manual edits.
+* **CSV-Driven**: Single CSV input (`hostname,username,password`)
+* **Hierarchical Structure**: Automatically organizes records under `/PAM Environments/<Project>/<Resources|Users>`
+* **End-to-End Automation**: Optional flags to control folder creation, gateway bootstrapping, PAM config, and more
+* **Idempotent**: Folder creation scripts are safe to re-run—no accidental overwrites
+* **Opinionated Defaults**: Ports, schedules, and naming conventions follow best practice (customizable)
+* **Offline Generation**: No API calls during script run; everything generated for review and approval
+* **Detailed Logging**: Timestamped log for each run
 
 ---
 
 ## Prerequisites
 
-| Requirement          | Minimum                                              |
-| -------------------- | ---------------------------------------------------- |
-| **Keeper Commander** | **17.0.11** (17.0.12 recommended)                    |
-| **Keeper Gateway**   | Network path to targets on TCP 5986                  |
-| **Python**           | 3.8+                                                 |
-| **CSV data**         | `hostname,initial_admin_user,initial_admin_password` |
-| **WinRM**            | HTTPS enabled on target servers                      |
+* **Python 3**
+* **[Keeper Commander](https://docs.keeper.io/secrets-manager/secrets-manager/keeper-commander/command-line-interface)** (installed and configured)
 
 ---
 
-## CSV format
+## Installation
 
-```csv
-hostname,initial_admin_user,initial_admin_password
-dc01.example.com,local-admin,CurrentSharedPassword123!
-10.20.30.42,local-admin,CurrentSharedPassword123!
+Save the script as `create_pam_script_improved.py`
+Make it executable:
+
+```bash
+chmod +x create_pam_script_improved.py
 ```
 
 ---
 
-## Command‑line flags (high‑lights)
+## CSV Format
 
-| Flag                        | Default                                          | Notes                                                     |
-| --------------------------- | ------------------------------------------------ | --------------------------------------------------------- |
-| `--gateway-uid`             | *required*                                       | UID of the Keeper Gateway managing these servers          |
-| `--csv`                     | `servers_to_import.csv`                          |                                                           |
-| `--user-folder`             | `PAM_Users`                                      | Shared‑folder for **pamUser** records                     |
-| `--resource-folder`         | `PAM_Resources`                                  | Shared‑folder for **pamMachine** records                  |
-| `--parent-folder`           | *(none)*                                         | Existing SF path to nest the two generated folders        |
-| `--rotation-admin-uid`      | *(none)*                                         | UID of a central admin credential used for resets         |
-| `--schedulejson`            | `{ "type":"DAILY", "time":"02:00", "tz":"UTC" }` | Any valid rotation schedule                               |
-| `--protocol`                | `rdp`                                            | `ssh`, `sql-server`, `mysql`, `postgresql` also supported |
-| `--enable-ssl-verification` | off                                              | Adds the checkbox to each **pamMachine**                  |
-| `--dry-run`                 | off                                              | Logs & file previews only – no writes                     |
+No header. Three columns:
 
-Run `--help` for the full list.
+```
+hostname,username,password
+```
 
----
+Example:
 
-## Generated artefacts
-
-| File    | What it contains                                                       |
-| ------- | ---------------------------------------------------------------------- |
-| \`\`    | Ready‑to‑import records (wrapper + blank `$pamSettings`)               |
-| \`\`    | `keeper import` + `pam config new` + optional `folder move`            |
-| \`\`    | One `pam connection edit` per machine (includes `--config`)            |
-| \`\`    | One `pam rotation set` per credential (includes `--config` & schedule) |
-| **Log** | `bulk_onboard_YYYYMMDDThhmmssZ.log` – INFO/WARN/ERROR lines            |
+```
+web-server-01,admin,P@ssw0rdABCD
+db-server-01,sa,Another$ecret1234
+linux-host-prod,root,SshKeyP@ss!
+```
 
 ---
 
-## Typical workflow
+## Arguments
 
-1. **Generate files** – run the script (use `--dry-run` first).
-2. **Import** – `keeper import pam_records_import.json --format json`.
-3. **Set up configs** – `bash pam_setup_commands.txt`.
-4. **Attach connections** – `bash pam_connection_commands.txt`.
-5. **Enable rotation** – `bash pam_rotation_commands.txt`.
-6. **Validate** –
+| Argument              | Required | Description                                                   |
+| --------------------- | -------- | ------------------------------------------------------------- |
+| `--csv`               | Yes      | Path to input CSV                                             |
+| `--project-name`      | No       | Project name (folders/gateway/config). Default: `PAM Project` |
+| `--create-folders`    | No       | Generate folder structure                                     |
+| `--create-gateway`    | No       | Generate new KSM Gateway commands                             |
+| `--create-pam-config` | No       | Generate new PAM Config commands                              |
+| `--gateway-uid`       | Maybe    | Existing Gateway UID (required if not creating new gateway)   |
+| `--protocol`          | No       | Connection protocol (`WINRM`, `SSH`). Default: `WINRM`        |
+| `--port`              | No       | Override protocol default port                                |
+| `--enable-recording`  | No       | Enable session recording                                      |
+| `--schedulejson`      | No       | Password rotation schedule in JSON (default: daily 02:00 UTC) |
+| `--dry-run`           | No       | Generate scripts but do not print execution instructions      |
+| `--user-folder`       | No       | Override default users folder name                            |
+| `--resource-folder`   | No       | Override default resources folder name                        |
+
+---
+
+## Example: Full Automation (New Project)
+
+```bash
+./create_pam_script_improved.py \
+  --csv finance_servers.csv \
+  --project-name "Finance Prod" \
+  --create-folders \
+  --create-gateway \
+  --create-pam-config \
+  --protocol WINRM \
+  --enable-recording
+```
+
+**Execution:**
+
+1. Run the command above.
+2. Run setup script:
 
    ```bash
-   pam connection list --folder "/PAM_Resources"
-   pam rotation  list --folder "/PAM_Users"
+   bash pam_setup_commands_[timestamp].txt
+   ```
+3. Enroll the Gateway using the provided one-time token, then set:
+
+   ```bash
+   export GATEWAY_UID=$(pam gateway list --format json | jq -r '.[] | select(.name=="Finance Prod Gateway") | .uid')
+   export PAM_CONFIG_UID=$(pam config list --format json | jq -r '.[] | select(.title=="Finance Prod Configuration") | .uid')
+   ```
+4. Run connection, rotation, and cleanup scripts:
+
+   ```bash
+   bash pam_connection_commands_[timestamp].txt
+   bash pam_rotation_commands_[timestamp].txt
+   bash pam_cleanup_commands_[timestamp].txt
    ```
 
 ---
 
-## FAQ
+## Example: Add Servers to Existing Project
+
+1. Get existing UIDs:
+
+   ```bash
+   pam gateway list
+   pam config list
+   ```
+2. Run:
+
+   ```bash
+   ./create_pam_script_improved.py \
+     --csv new_staging_servers.csv \
+     --project-name "Staging" \
+     --gateway-uid "YourGatewayUID" \
+     --protocol SSH
+   ```
+3. Set:
+
+   ```bash
+   export PAM_CONFIG_UID="YourPamConfigUID"
+   ```
+4. Run the generated import/connection scripts.
 
 ---
 
+## Logging
 
+Each run generates a timestamped log:
+`pam_onboard_log_[timestamp].txt`
+
+---
+
+## Pro Tips & Warnings
+
+* **Always validate your CSV**—bad or duplicate records will cause issues.
+* **Review all generated scripts before running** (especially in production).
+* **Folder creation scripts are safe to rerun**—useful for incremental onboarding.
+* **Handle CSVs with care**—they contain live credentials.
+
+---
+
+## Contributions
+
+Open PRs/issues for bugs, feature requests, or improvements.
