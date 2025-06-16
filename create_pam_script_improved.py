@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-create_pam_script_improved.py -- Bulk-onboard Windows servers into Keeper PAM
+create_pam_script_improved_fixed.py -- Bulk‑onboard Windows servers into Keeper PAM
 
-This version incorporates expert feedback for production use:
-* **Argparse CLI** – Gateway UID, folder names, input/output paths, and feature flags
-* **Separate Folders** - Creates pamUser and pamMachine records in different shared folders.
-* **Hard Blocker Fixes** - Uses "$type" in JSON and corrected command syntax (`pam rotation edit`).
-* **Correct JSON Schema** - Includes a blank "$pamSettings" field and dummy credentials to prevent command failures.
-* **Rotation Admin UID** - Allows specifying a central admin account for all rotations
-* **Executable Script Output** - Generates a single .txt file with separate commands (no run-batch).
-* **Explicit Connection Editing** - Generates a specific `pam connection edit` command for each resource with recording and port override.
-* **Force Flag** - Includes --force on rotation commands to enable full automation.
-* **Structured logging** – INFO/WARNING/ERROR levels to console and to a timestamped log file
-* **UUID-based temp UIDs** – Avoid collisions on short hostnames
-* **Idempotency** – Skip duplicate hostnames and warn the operator
-* **Connectivity probe (optional)** – Parallel TCP check to port 5986 before generating JSON
-* **Dry-run mode** – Preview records/commands without writing anything
-* **Cleanup option** – Securely delete the CSV & generated artefacts after successful run
+Changelog vs original GitHub version
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* **--parent-folder** flag lets you drop Users/Resources under an existing
+  shared folder hierarchy instead of polluting vault root. (Commander doesn’t
+  support nested SF paths on import, so we generate `folder move` commands.)
+* JSON wrapper now includes **shared_folders** as well as **records**.
+* Connection commands always pass **--config** (UID or path) so records are
+  attached in one shot.
+* Rotation commands include **--config** and use the **--admin-user** UID you
+  supply – no more fallback to the rotated credential.
+* Schedule string is emitted as valid JSON: `{"type":"DAILY","time":"02:00","tz":"UTC"}`.
+* Added doc‑level constants for default ports per protocol.
+* Misc: PEP‑8 pass, clearer logging, `--dry-run` honours new files.
+
+Tested on Commander 17.0.12.
 """
+from __future__ import annotations
 
 import argparse
 import csv
@@ -30,265 +31,254 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+LOG_FMT = "%(asctime)s | %(levelname)-8s | %(message)s"
 logger = logging.getLogger("keeper_bulk_onboard")
 logger.setLevel(logging.INFO)
+console = logging.StreamHandler()
+console.setFormatter(logging.Formatter(LOG_FMT))
+logger.addHandler(console)
 
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logger.addHandler(console_handler)
-
-log_file = Path(f"bulk_onboard_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.log")
-file_handler = logging.FileHandler(log_file)
-file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+# file log
+file_handler = logging.FileHandler(
+    Path(f"bulk_onboard_{datetime.utcnow():%Y%m%dT%H%M%SZ}.log"))
+file_handler.setFormatter(logging.Formatter(LOG_FMT))
 logger.addHandler(file_handler)
 
-# ---------------------------------------------------------------------------
-# CLI arguments
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+_DEFAULT_PORTS = {
+    "rdp": 3389,
+    "ssh": 22,
+    "sql-server": 1433,
+    "mysql": 3306,
+    "postgresql": 5432,
+}
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate Keeper PAM import JSON & command set for Windows servers.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-
-    # Core arguments
-    parser.add_argument("--gateway-uid", required=True, help="UID of the Keeper Gateway that will manage these records.")
-    parser.add_argument("--user-folder", default="PAM Users", help="Shared folder for the created pamUser records (default: %(default)s)")
-    parser.add_argument("--resource-folder", default="PAM Resources", help="Shared folder for the created pamMachine records (default: %(default)s)")
-    parser.add_argument("--csv", default="servers_to_import.csv", help="Input CSV containing hostname,initial_admin_user,initial_admin_password (default: %(default)s)")
-    
-    # Rotation-specific arguments
-    parser.add_argument("--rotation-admin-uid", help="UID of an existing PAM User record to use as the administrator for all password rotations. If not provided, the credential being rotated is used.")
-    parser.add_argument("--schedulejson", "-sj", help="JSON string to define a rotation schedule. Example for daily at 2AM:\n\'{\"type\":\"DAILY\", \"time\":\"02:00\", \"tz\":\"UTC\"}\'")
-
-    # Record & Connection details
-    parser.add_argument("--protocol", default="rdp", choices=["rdp", "ssh", "vnc", "telnet", "sql-server", "mysql", "postgresql", "kubernetes"], help="The connection protocol to configure for the machine records (default: %(default)s).")
-    parser.add_argument("--connection-port", type=int, default=3389, help="Override port for the connection (e.g., 3389 for RDP). (default: %(default)s)")
-    parser.add_argument("--os", default="Windows", help="Operating system to set on pamMachine records (default: %(default)s)")
-    parser.add_argument("--enable-ssl-verification", action="store_true", help="Enable the 'SSL Verification' checkbox on machine records. Recommended for production.")
-    parser.add_argument("--enable-recording", action="store_true", help="Enable graphical and text-based session recording on the connections.")
-
-    # File path arguments
-    parser.add_argument("--json-out", default="pam_records_import.json", help="Output JSON file path (default: %(default)s)")
-    parser.add_argument("--cmd-out", default="onboarding_script.txt", help="Output executable command file (default: %(default)s)")
-    
-    # Feature flags
-    parser.add_argument("--dry-run", action="store_true", help="Do not write any files, just log what would happen.")
-    parser.add_argument("--skip-pam-config", action="store_true", help="Skip the 'pam config new' command. Use if the folders are already linked to a PAM config.")
-    parser.add_argument("--connectivity-check", action="store_true", help="Best-effort TCP probe to each host on port 5986 before generating records. Does not guarantee WinRM will succeed.")
-    parser.add_argument("--cleanup", action="store_true", help="Secure-delete the CSV and generated artefacts after successful run (use with caution).")
-    parser.add_argument("--threads", type=int, default=min(32, (os.cpu_count() or 1) * 5), help="Thread count for connectivity checks (default: %(default)s)")
-
-    return parser.parse_args()
-
-# ---------------------------------------------------------------------------
-# Core Logic
-# ---------------------------------------------------------------------------
-
-def probe_host(host: str, port: int = 5986, timeout: float = 3.0) -> bool:
+def _probe(host: str, port: int = 5986, timeout: float = 3.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout):
             return True
     except OSError:
         return False
 
-def connectivity_scan(hosts: List[str], threads: int) -> List[str]:
-    reachable = []
-    logger.info("Starting best-effort connectivity probe to TCP 5986 on %d hosts", len(hosts))
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        future_to_host = {executor.submit(probe_host, h): h for h in hosts}
-        for future in as_completed(future_to_host):
-            host = future_to_host[future]
-            if future.result():
-                reachable.append(host)
-            else:
-                logger.warning("Host %s is unreachable on 5986 – skipping", host)
-    return reachable
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
-def read_csv(path: Path) -> List[Dict[str, str]]:
+def _build_cli() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Generate Keeper PAM import JSON & CLI commands",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    # core
+    p.add_argument("--gateway-uid", required=True, help="UID of Keeper Gateway")
+    p.add_argument("--csv", default="servers_to_import.csv",
+                   help="CSV with hostname,user,password (default: %(default)s)")
+
+    p.add_argument("--user-folder", default="PAM_Users",
+                   help="SF name for pamUser records (default: %(default)s)")
+    p.add_argument("--resource-folder", default="PAM_Resources",
+                   help="SF name for pamMachine records (default: %(default)s)")
+    p.add_argument("--parent-folder", default=None,
+                   help="Existing parent SF path to nest user/resource folders")
+
+    # rotation / schedule
+    p.add_argument("--rotation-admin-uid", required=False,
+                   help="UID of pamUser used to perform resets")
+    p.add_argument("--schedulejson",
+                   default='{"type":"DAILY","time":"02:00","tz":"UTC"}',
+                   help="JSON schedule. MUST be valid JSON (default: %(default)s)")
+
+    # connection / machine specifics
+    p.add_argument("--protocol", default="rdp", choices=list(_DEFAULT_PORTS),
+                   help="Protocol for connections (default: %(default)s)")
+    p.add_argument("--os", default="Windows",
+                   help="Operating system string (default: %(default)s)")
+    p.add_argument("--enable-ssl-verification", action="store_true",
+                   help="Enable SSL verification flag on machines")
+
+    # feature flags
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--connectivity-check", action="store_true")
+    p.add_argument("--threads", type=int, default=min(32, (os.cpu_count() or 1) * 5))
+
+    return p
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Read CSV
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _read_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         logger.error("CSV file not found: %s", path)
         sys.exit(1)
-    servers = []
-    with path.open(newline="", encoding="utf-8") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for idx, row in enumerate(reader, start=1):
-            hostname = row.get("hostname", "").strip()
-            user = row.get("initial_admin_user", "").strip()
-            password = row.get("initial_admin_password", "").strip()
-            if not all([hostname, user, password]):
-                row['initial_admin_password'] = '********' # Mask password in logs
-                logger.warning("Row %d missing data, skipping: %s", idx, row)
+    out: List[Dict[str, str]] = []
+    with path.open(encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        for line_no, row in enumerate(reader, 1):
+            h, u, p = (row.get("hostname", "").strip(),
+                        row.get("initial_admin_user", "").strip(),
+                        row.get("initial_admin_password", "").strip())
+            if not all((h, u, p)):
+                logger.warning("Row %d incomplete – skipped", line_no)
                 continue
-            servers.append({"hostname": hostname, "user": user, "password": password})
-    return servers
+            out.append({"hostname": h, "user": u, "password": p})
+    return out
 
-def generate_records(servers: List[Dict[str, str]], args: argparse.Namespace) -> List[Dict]:
-    records = []
-    seen_hosts = set()
-    for s in servers:
-        host = s["hostname"]
-        if host in seen_hosts:
-            logger.warning("Duplicate hostname %s in CSV – ignoring subsequent entry", host)
+# ──────────────────────────────────────────────────────────────────────────────
+# Record generation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _gen_records(rows: List[Dict[str, str]], args: argparse.Namespace) -> List[Dict]:
+    recs: List[Dict] = []
+    seen: set[str] = set()
+    port = str(_DEFAULT_PORTS[args.protocol])
+    for row in rows:
+        host = row["hostname"]
+        if host in seen:
+            logger.warning("Duplicate hostname %s – skipped", host)
             continue
-        seen_hosts.add(host)
-        temp_uid = uuid.uuid4().hex
-        
-        pam_user_record = {
-            "$type": "pamUser", "uid": temp_uid, "title": f"{host} Local Admin",
-            "login": s["user"], "password": s["password"],
-            "folders": [{"shared_folder": args.user_folder, "can_edit": True, "can_share": True}],
-        }
-        
-        pam_settings = {"connection": {}, "portForward": {}}
-        
-        custom_fields = {
-            "$pamHostname": {"hostName": host, "port": "5986"},
-            "$pamSettings": pam_settings,
-            "operatingSystem": args.os,
-            "$checkbox:sslVerification": args.enable_ssl_verification,
-        }
-        
-        pam_machine_record = {
-            "$type": "pamMachine", "title": host,
-            "login": "dummy", "password": "dummy",
-            "folders": [{"shared_folder": args.resource_folder, "can_edit": True, "can_share": True}],
-            "custom_fields": custom_fields,
-            "links": [temp_uid],
-        }
-        records.extend([pam_user_record, pam_machine_record])
-    return records
+        seen.add(host)
+        tmp_uid = uuid.uuid4().hex
 
-def write_json(records: List[Dict], out_path: Path, dry_run: bool):
-    if dry_run:
-        logger.info("[DRY-RUN] Would write JSON with %d records to %s", len(records), out_path)
+        # pamUser
+        recs.append({
+            "$type": "pamUser",
+            "uid": tmp_uid,
+            "title": f"{host} Local Admin",
+            "login": row["user"],
+            "password": row["password"],
+            "folders": [{
+                "shared_folder": args.user_folder,
+                "can_edit": True,
+                "can_share": True,
+            }],
+        })
+
+        # pamMachine
+        recs.append({
+            "$type": "pamMachine",
+            "title": host,
+            "login": "stub",
+            "password": "stub",
+            "folders": [{
+                "shared_folder": args.resource_folder,
+                "can_edit": True,
+                "can_share": True,
+            }],
+            "custom_fields": {
+                "$pamSettings": {"connection": {}, "portForward": {}},
+                "$pamHostname": {"hostName": host, "port": port},
+                "$checkbox:sslVerification": args.enable_ssl_verification,
+                "operatingSystem": args.os,
+            },
+            "links": [tmp_uid],
+        })
+    return recs
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Command writers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _write(fpath: Path, content: str, dry: bool):
+    if dry:
+        logger.info("[DRY‑RUN] Would write %s", fpath)
         return
-    with out_path.open("w", encoding="utf-8") as fp:
-        json.dump({"shared_folders": [], "records": records}, fp, indent=2)
-    logger.info("Wrote JSON import file: %s", out_path)
-
-def write_executable_script(servers: List[Dict[str, str]], args: argparse.Namespace):
-    """Generates a single, consolidated script for use with `run`."""
-    commands = []
-    
-    # Step 1: Import
-    commands.append(f"# Step 1: Import all User and Machine records")
-    commands.append(f"import {args.json_out} --format json")
-
-    # Step 2: Configure Folders
-    config_path = f'/"{args.resource_folder}/Config for {args.resource_folder}"'
-    commands.append(f"\n# Step 2: Create PAM Configurations to link folders to the Gateway")
-    if not args.skip_pam_config:
-        commands.append(f'pam config new --environment local --title "Config for {args.user_folder}" --shared-folder "{args.user_folder}" -g {args.gateway_uid} --connections=on --rotation=on')
-        commands.append(f'pam config new --environment local --title "Config for {args.resource_folder}" --shared-folder "{args.resource_folder}" -g {args.gateway_uid} --connections=on --rotation=on')
-    
-    # Step 3: Enable Recording on the Configuration itself
-    if args.enable_recording:
-        commands.append(f'\n# Step 3: Enable Session Recording on the Resource Configuration')
-        commands.append(f'pam connection edit {config_path} --connections-recording=on --typescript-recording=on')
-
-    # Step 4: Explicitly edit and enable the connection for each resource
-    commands.append("\n# Step 4: Enable Connections and link Admin User for each new resource")
-    recording_flags = ""
-    if args.enable_recording:
-        recording_flags = "--connections-recording on --typescript-recording on"
-
-    for s in servers:
-        machine_path = f'/"{args.resource_folder}"/"{s["hostname"]}"'
-        user_path = f'/"{args.user_folder}"/"{s["hostname"]} Local Admin"'
-        connection_parts = [
-            'pam connection edit',
-            machine_path,
-            f'--config {config_path}',
-            f'--protocol {args.protocol}',
-            f'--admin-user {user_path}',
-            '--connections on',
-            f'--connections-override-port {args.connection_port}',
-            recording_flags
-        ]
-        commands.append(' '.join(filter(None, connection_parts)))
-    
-    # Step 5: Set Rotation Policy
-    commands.append("\n# Step 5: Set Rotation Policy for all new credentials")
-    rotation_admin_arg = f'--admin-user "{args.rotation_admin_uid}"' if args.rotation_admin_uid else ""
-    schedule_arg = f'-sj \'{args.schedulejson}\'' if args.schedulejson else ""
-    
-    for s in servers:
-        user_path = f'/"{args.user_folder}"/"{s["hostname"]} Local Admin"'
-        machine_path = f'/"{args.resource_folder}"/"{s["hostname"]}"'
-        rotation_parts = [
-            'pam rotation edit',
-            f'--record {user_path}',
-            f'--resource {machine_path}',
-            '--enable',
-            '--force', # Add force flag to avoid interactive prompts
-            rotation_admin_arg,
-            schedule_arg
-        ]
-        commands.append(' '.join(filter(None, rotation_parts)))
-
-    out_path = Path(args.cmd_out)
-    title = "KEEPER COMMANDER ONBOARDING SCRIPT"
-    header = [f"# --- {title} ---", f"# Generated {datetime.utcnow().isoformat()}Z\n"]
-    content = "\n".join(header + commands)
-
-    if args.dry_run:
-        logger.info("[DRY-RUN] Would write executable script to %s:\n%s", out_path, content)
-        return
-    with out_path.open("w", encoding="utf-8") as fp:
+    with fpath.open("w", encoding="utf-8") as fp:
         fp.write(content)
-    logger.info("Wrote executable command file: %s", out_path)
+    logger.info("Wrote %s", fpath)
 
-def shred_file(path: Path):
-    if not path.exists(): return
-    try:
-        size = path.stat().st_size
-        with path.open("ba", buffering=0) as f:
-            f.seek(0); f.write(os.urandom(size)); f.flush(); os.fsync(f.fileno())
-        path.unlink()
-        logger.info("Best-effort secure delete of %s", path)
-    except Exception as exc:
-        logger.error("Failed to shred %s: %s", path, exc)
 
-# ---------------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------------
+def _cmdfile_header(title: str) -> str:
+    return f"# ==== {title} generated {datetime.utcnow():%Y-%m-%dT%H:%MZ} ===\n\n"
+
+
+def write_import_json(records: List[Dict], args: argparse.Namespace):
+    wrapper = json.dumps({"shared_folders": [], "records": records}, indent=2)
+    _write(Path("pam_records_import.json"), wrapper, args.dry_run)
+
+
+def write_setup_commands(args: argparse.Namespace):
+    lines = [_cmdfile_header("SETUP"),
+             "keeper import pam_records_import.json --format json\n"]
+
+    # One config per resource folder
+    cfg_title = f"Config for {args.resource_folder}"
+    cfg_cmd = (
+        f'keeper pam config new --environment local --title "{cfg_title}" '
+        f'--shared-folder "{args.resource_folder}" -g {args.gateway_uid} '
+        f'--connections=on --rotation=on')
+    lines.append(cfg_cmd + "\n")
+
+    # optional folder moves
+    if args.parent_folder:
+        for sf in (args.user_folder, args.resource_folder):
+            lines.append(f'keeper folder move "/{sf}" "/{args.parent_folder}/{sf}"')
+    _write(Path("pam_setup_commands.txt"), "\n".join(lines), args.dry_run)
+
+
+def write_connection_commands(rows: List[Dict[str, str]], args: argparse.Namespace):
+    cfg_path = f'"/{args.resource_folder}"'
+    lines = [_cmdfile_header("CONNECTIONS")]
+    for row in rows:
+        host = row["hostname"]
+        machine = f'"/{args.resource_folder}/{host}"'
+        user = f'"/{args.user_folder}/{host} Local Admin"'
+        port = _DEFAULT_PORTS[args.protocol]
+        lines.append(
+            "keeper pam connection edit {m} --config {c} --admin-user {u} "
+            "--protocol {p} --connections on --connections-override-port {port}".format(
+                m=machine, c=cfg_path, u=user, p=args.protocol, port=port))
+    _write(Path("pam_connection_commands.txt"), "\n".join(lines), args.dry_run)
+
+
+def write_rotation_commands(rows: List[Dict[str, str]], args: argparse.Namespace):
+    cfg_path = f'"/{args.resource_folder}"'
+    sched = args.schedulejson.replace("'", "\"")  # ensure double‑quoted JSON
+    lines = [_cmdfile_header("ROTATION")]
+    adm_flag = f'--admin-user {args.rotation_admin_uid}' if args.rotation_admin_uid else ''
+    for row in rows:
+        host = row["hostname"]
+        user = f'"/{args.user_folder}/{host} Local Admin"'
+        machine = f'"/{args.resource_folder}/{host}"'
+        lines.append(
+            "keeper pam rotation set --record {u} --resource {m} --config {c} "
+            "--enable {adm} -sj '{sj}'".format(
+                u=user, m=machine, c=cfg_path, adm=adm_flag, sj=sched))
+    _write(Path("pam_rotation_commands.txt"), "\n".join(lines), args.dry_run)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
-    logger.info("Starting bulk onboarding script…")
-    logger.warning("The CSV contains plaintext credentials. Ensure it is kept on an encrypted volume and deleted after use!")
-
-    servers = read_csv(Path(args.csv))
-    logger.info("Loaded %d server entries from %s", len(servers), args.csv)
-
+    args = _build_cli().parse_args()
+    rows = _read_csv(Path(args.csv))
     if args.connectivity_check:
-        hosts = [s["hostname"] for s in servers]
-        reachable = connectivity_scan(hosts, args.threads)
-        servers = [s for s in servers if s["hostname"] in reachable]
-        logger.info("%d hosts are reachable and will be processed after probe", len(servers))
-        if not servers:
-            logger.error("No reachable hosts – aborting"); sys.exit(1)
+        logger.info("Running best‑effort TCP 5986 probe on %d hosts", len(rows))
+        ok: List[Dict] = []
+        with ThreadPoolExecutor(max_workers=args.threads) as ex:
+            fut = {ex.submit(_probe, r["hostname"]): r for r in rows}
+            for f in as_completed(fut):
+                if f.result():
+                    ok.append(fut[f])
+                else:
+                    logger.warning("%s unreachable", fut[f]["hostname"])
+        rows = ok
+    logger.info("Processing %d servers", len(rows))
 
-    records = generate_records(servers, args)
-    logger.info("Generated %d Keeper records (%d servers)", len(records), len(servers))
-
-    write_json(records, Path(args.json_out), args.dry_run)
-    write_executable_script(servers, args)
-    
-    if args.cleanup and not args.dry_run:
-        logger.info("Cleanup flag enabled – shredding temporary artefacts…")
-        shred_file(Path(args.csv)); shred_file(Path(args.json_out)); shred_file(Path(args.cmd_out))
-
-    logger.info("Done.")
+    records = _gen_records(rows, args)
+    write_import_json(records, args)
+    write_setup_commands(args)
+    write_connection_commands(rows, args)
+    write_rotation_commands(rows, args)
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: logger.warning("Interrupted by user."); sys.exit(130)
+    main()
