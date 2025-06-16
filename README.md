@@ -27,7 +27,7 @@ python3 create_pam_script_improved_fixed.py \
   --csv servers_to_import.csv \
   --user-folder PAM_Users \
   --resource-folder PAM_Resources \
-  --parent-folder "My Vault/TobyTestFolder" \
+  --parent-folder "My Vault/TestFolder" \
   --rotation-admin-uid <ADMIN_UID>
 
 # import & run
