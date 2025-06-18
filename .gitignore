@@ -1,0 +1,5 @@
+__pycache__/
+*.log
+pam_*_commands.txt
+pam_records_import.json
+*.csv
