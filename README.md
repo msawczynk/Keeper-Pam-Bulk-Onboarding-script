@@ -22,7 +22,7 @@
 ## TL;DR
 
 ```bash
-python3 create_pam_script_improved_fixed.py \
+python3 create_pam_script_improved.py \
   --gateway-uid <GW_UID> \
   --csv servers_to_import.csv \
   --user-folder PAM_Users \
@@ -38,6 +38,29 @@ bash pam_rotation_commands.txt
 ```
 
 *Everything* will be wired, enabled and scheduled – zero manual edits.
+
+### Using the custom Commander fork
+
+This project relies on the [pam-import-add-directory-admin-for-local-machines](https://github.com/Keeper-Security/Commander/tree/pam-import-add-directory-admin-for-local-machines) branch of **Keeper Commander**.
+Clone the repository and install it with `pip install -e .` before running the
+commands below.
+
+### Converting CSV to JSON
+
+Give the script a simple CSV with `hostname,initial_admin_user,initial_admin_password` and it will produce `pam_records_import.json` along with the helper command files.
+For example the CSV
+
+```csv
+server1,admin,1234
+server2,admin,1234
+server3,admin,1234
+```
+
+becomes a JSON wrapper ready for `keeper import` once you run:
+
+```bash
+python3 create_pam_script_improved.py --gateway-uid <GW_UID> --csv servers.csv
+```
 
 ---
 
@@ -84,13 +107,13 @@ Run `--help` for the full list.
 
 ## Generated artefacts
 
-| File    | What it contains                                                       |
-| ------- | ---------------------------------------------------------------------- |
-| \`\`    | Ready‑to‑import records (wrapper + blank `$pamSettings`)               |
-| \`\`    | `keeper import` + `pam config new` + optional `folder move`            |
-| \`\`    | One `pam connection edit` per machine (includes `--config`)            |
-| \`\`    | One `pam rotation set` per credential (includes `--config` & schedule) |
-| **Log** | `bulk_onboard_YYYYMMDDThhmmssZ.log` – INFO/WARN/ERROR lines            |
+| File | What it contains |
+| ------- | ---------------- |
+| `pam_records_import.json` | Ready-to-import records (wrapper + blank `$pamSettings`) |
+| `pam_setup_commands.txt` | `keeper import` + `pam config new` + optional `folder move` |
+| `pam_connection_commands.txt` | One `pam connection edit` per machine (includes `--config`) |
+| `pam_rotation_commands.txt` | One `pam rotation set` per credential (includes `--config` & schedule) |
+| **Log** | `bulk_onboard_YYYYMMDDThhmmssZ.log` – INFO/WARN/ERROR lines |
 
 ---
 
@@ -107,11 +130,21 @@ Run `--help` for the full list.
    pam connection list --folder "/PAM_Resources"
    pam rotation  list --folder "/PAM_Users"
    ```
+7. **Run tests** – `pytest`.
 
 ---
 
 ## FAQ
 
 ---
+
+**Q: Can I run the script multiple times?**
+
+Yes. Duplicate hostnames in the CSV are ignored with a warning in the log.
+
+**Q: What happens if a server is unreachable?**
+
+Use `--connectivity-check` to probe TCP 5986. Hosts that fail the check are
+skipped so the generated files contain only reachable machines.
 
 
