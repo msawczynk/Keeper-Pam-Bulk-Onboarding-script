@@ -66,10 +66,7 @@ During execution the script validates the template **before** touching any data.
 ## 3 – Generate the Import File
 
 ```bash
-python3 import_rdp_servers.py \
-  --input-file servers_to_import.csv \
-  --template-file import_template.json \
-  --output-file pam_import.json
+python3 import_rdp_servers.py --input-file servers_to_import.csv  --template-file import_template.json --output-file pam_import.json
 ```
 
 | Option            | Default    | Description                                                                                   |
