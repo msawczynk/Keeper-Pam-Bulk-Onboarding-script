@@ -17,7 +17,7 @@ This guide explains how to convert a simple CSV list of Windows hosts into a **P
 
 | Requirement                               | Notes                           |
 | ----------------------------------------- | ------------------------------- |
-| Keeper Commander v17.6 or later           | Verify with `keeper version`    |
+| Keeper Commander v17.1.1 or later           | Verify with `keeper version`    |
 | Python 3.8+                               | Required to execute the script  |
 | Keeper PAM module                         | Enabled in the vault & licensed |
 | Admin role with **Manage PAM** permission | Needed to import projects       |
